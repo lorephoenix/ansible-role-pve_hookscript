@@ -1,0 +1,1408 @@
+#!/usr/bin/env bash
+#===============================================================================
+# Script Name:    hookscript.sh
+# Description:    Create system account & group and accessible via SSH
+# Author:         Christophe Vermeren
+# License:        MIT License
+#===============================================================================
+
+# MIT License
+#
+# Copyright (c) 2024 Christophe Vermeren
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+# ----------------------------------------------------------------------------
+# F U N C T I O N S
+# ----------------------------------------------------------------------------
+#
+function __check_configline() {
+    # Function: __check_configline
+    # Description:
+    #
+    # Parameters:
+    #   $1  - The ID of the Proxmox LXC container (VMID).
+    #   $2  - Shell type
+    #   $3  - regular expression to filter from configuration file.
+    #
+    # Return:
+    #   - Returns `0` (failure) if configuration line does not exist in the container.
+    #   - Returns `1` (sucess) if configuration line exist in the container.
+    echo $(pct exec ${1} -- ${2} -c "${3}")
+}
+
+function __check_dir_exist() {
+    # Function: __check_dir_exist
+    # Description:
+    #   This function checks if a specified directory exists inside a Proxmox container.
+    #
+    # Parameters:
+    #   $1 - Container ID (VMID) of the target container
+    #   $2 - Shell type
+    #   $3 - Full path to the file to check
+    #
+    # Returns:
+    #   '0' if the directory does not exist
+    #   '1' if the directory exists
+    echo $(pct exec ${1} -- ${2} -c "ls -d ${3} 2>/dev/null | grep -c ${3}")
+}
+
+function __check_file_exist() {
+    # Function: __check_file_exist
+    # Description:
+    #   This function checks if a specified file exists inside a Proxmox container.
+    #
+    # Parameters:
+    #   $1 - Container ID (VMID) of the target container
+    #   $2 - Shell type
+    #   $3 - Full path to the file to check
+    #
+    # Returns:
+    #   '0' if the file does not exist
+    #   '1' if the file exists
+    echo $(pct exec ${1} -- ${2} -c "ls -l ${3} 2>/dev/null | grep -c ${3}")
+}
+
+function __check_group() {
+    # Function: __check_group
+    # Description:
+    #   This function checks whether a specific group exists inside a Proxmox LXC container.
+    #   It queries the container for the group using `getent group` and returns `0` if the group exists,
+    #   or `1` if the group does not exist.
+    #
+    # Parameters:
+    #   $1  - The ID of the Proxmox LXC container (VMID).
+    #   $2  - Shell type
+    #   $3  - The name of the group to check.
+    #
+    # Return:
+    #   - Returns `0` (failure) if the group does not exist in the container.
+    #   - Returns `1` (success) if the group exists in the container.
+    #
+    # Notes:
+    #   - This function uses `pct exec` to execute commands inside the Proxmox container.
+    #   - The `getent group` command queries the system for the specified group, and `grep -c` counts
+    #     the occurrences of the group name in the output.
+    echo $(pct exec $1 -- ${2} -c "getent group $3 | grep -c \"$3\"")
+}
+
+function __check_user() {
+    # Function: __check_user
+    # Description:
+    #   This function checks whether a specific user exists inside a Proxmox LXC container.
+    #   It queries the container for the user using `getent passwd` and returns `0` if the user exists,
+    #   or `1` if the user does not exist.
+    #
+    # Parameters:
+    #   $1  - The ID of the Proxmox LXC container (VMID).
+    #   $3  - Shell type
+    #   $2  - The name of the user to check.
+    #
+    # Return:
+    #   - Returns `0` (failure) if the user does not exist in the container.
+    #   - Returns `1` (success) if the user exists in the container.
+    #
+    # Notes:
+    #   - This function uses `pct exec` to execute commands inside the Proxmox container.
+    #   - The `getent passwd` command queries the system for the specified user, and `grep -c` counts
+    #     the occurrences of the username in the output.
+    echo $(pct exec $1 -- $2 -c "getent passwd $3 | grep -c \"$3\"")
+}
+
+function __create_filter() {
+    # Function: __create_filter
+    # Description:
+    #   Builds a filter command by concatenating a base filter string with a
+    #   list of files. It then appends error redirection and a conditional
+    #   output to indicate success or failure.
+    #
+    # Arguments:
+    #   $1 - The base filter string (e.g., a command or operation to be
+    #        performed).
+    #   $2 - An array of files to be included in the filter.
+
+    # Check if the first argument (base filter) is provided
+    local FILTER=$1
+
+    # Check if the second argument (array of files) is provided and is not empty
+    local FILES=("${@:2}")
+
+    # Loop through the array of files and append each file to the filter string
+    for FILE in "${FILES[@]}"; do
+        FILTER+=" \"$FILE\""  # Append the file name to the filter string
+    done
+
+    # Append error redirection and conditional success/failure logic
+    FILTER+=" 2>/dev/null && echo 1 || echo 0"
+
+    # Return the constructed filter command
+    echo "${FILTER}"
+}
+
+# Functions to display message based on severity
+function __v_ok() {
+    # Function: __v_ok
+    # Description:
+    #   This function performs logging for a specific container (VM) by:
+    #     - Validating that exactly three arguments are passed.
+    #     - Formatting and displaying a log message with color-coded output.
+    #     - Appending the log message to a log file within the specified container.
+    #
+    # Arguments:
+    #   1. VMID   - The ID of the Proxmox container where the log message will be appended.
+    #   2. SHELL  - The shell to use when executing the log command inside the container.
+    #   3. MESSAGE - The informational message to log.
+    #
+    # Exit Codes:
+    #   1 - Error due to incorrect number of arguments.
+
+    # Check if the function received exactly three arguments
+    if [ "$#" -ne 3 ]; then
+        echo -e "${BLUE}[${RED}ERROR${BLUE}]${RESTORE} The function '__v_ok' did not receive exactly 3 arguments."
+        exit 1
+    fi
+
+    # Assign arguments to local variables for better readability
+    local VMID=$1             # The ID of the container (VMID)
+    local SHELL=$2            # The shell to use for execution (e.g., /bin/bash)
+    local MESSAGE="$3"        # The informational message to log
+
+    # Format the log message with coloring
+    local LOG_MESSAGE="${BLUE}[${GREEN}OK${BLUE}]${RESTORE} ${MESSAGE}"
+
+    # Print the message to the console
+    echo -e "${LOG_MESSAGE}"
+
+    # Append the message to the log file inside the container
+    # The log file name is derived from the script name (${0##*/})
+    pct exec "${VMID}" -- "${SHELL}" -c "echo -e \"${LOG_MESSAGE}\" >> /root/${0##*/}.log"
+}
+
+function __v_info() {
+    # Function: __v_info
+    # Description:
+    #   Logs an informational message to the console and appends it to a log file inside
+    #   a specific virtual machine. Uses Proxmox `pct exec` to execute commands inside
+    #   the container.
+    #
+    # Arguments:
+    #   1. VMID   - The ID of the Proxmox container where the log message will be appended.
+    #   2. SHELL  - The shell to use when executing the log command inside the container.
+    #   3. MESSAGE - The informational message to log.
+    #
+    # Exit Codes:
+    #   1 - Error due to incorrect number of arguments.
+
+    # Check if the function received exactly three arguments
+    if [ "$#" -ne 3 ]; then
+        echo -e "${BLUE}[${RED}ERROR${BLUE}]${RESTORE} The function did not receive exactly 3 arguments."
+        exit 1
+    fi
+
+    # Assign arguments to local variables for better readability
+    local VMID=$1             # The ID of the container (VMID)
+    local SHELL=$2            # The shell to use for execution (e.g., /bin/bash)
+    local MESSAGE="$3"        # The informational message to log
+
+    # Format the log message with coloring
+    local LOG_MESSAGE="${BLUE}[${CYAN}INFO${BLUE}]${RESTORE} ${MESSAGE}"
+
+    # Print the message to the console
+    echo -e "${LOG_MESSAGE}"
+
+    # Append the message to the log file inside the container
+    # The log file name is derived from the script name (${0##*/})
+    pct exec "${VMID}" -- "${SHELL}" -c "echo -e \"${LOG_MESSAGE}\" >> /root/${0##*/}.log"
+}
+
+function __v_warning() {
+    # Function: __v_warning
+    # Description:
+    #   Logs a warning message to the console and appends it to a log file inside
+    #   a specific virtual machine. Uses Proxmox `pct exec` to execute commands inside
+    #   the container.
+    #
+    # Arguments:
+    #   1. VMID   - The ID of the Proxmox container where the log message will be appended.
+    #   2. SHELL  - The shell to use when executing the log command inside the container.
+    #   3. MESSAGE - The informational message to log.
+    #
+    # Exit Codes:
+    #   1 - Error due to incorrect number of arguments.
+
+    # Check if the function received exactly three arguments
+    if [ "$#" -ne 3 ]; then
+        echo -e "${BLUE}[${RED}ERROR${BLUE}]${RESTORE} The function did not receive exactly 3 arguments."
+        exit 1
+    fi
+
+    # Assign arguments to local variables for better readability
+    local VMID=$1             # The ID of the container (VMID)
+    local SHELL=$2            # The shell to use for execution (e.g., /bin/bash)
+    local MESSAGE="$3"        # The informational message to log
+
+    # Format the log message with coloring
+    local LOG_MESSAGE="${BLUE}[${YELLOW}WARN${BLUE}]${RESTORE} ${MESSAGE}"
+
+    # Print the message to the console
+    echo -e "${LOG_MESSAGE}"
+
+    # Append the message to the log file inside the container
+    # The log file name is derived from the script name (${0##*/})
+    pct exec "${VMID}" -- "${SHELL}" -c "echo -e \"${LOG_MESSAGE}\" >> /root/${0##*/}.log"
+}
+
+function __v_error() {
+    # Function: __v_info
+    # Description:
+    #   Logs an error message to the console and appends it to a log file inside
+    #   a specific virtual machine. Uses Proxmox `pct exec` to execute commands inside
+    #   the container.
+    #
+    # Arguments:
+    #   1. VMID   - The ID of the Proxmox container where the log message will be appended.
+    #   2. SHELL  - The shell to use when executing the log command inside the container.
+    #   3. MESSAGE - The informational message to log.
+    #
+    # Exit Status:
+    #   Exits with a status of 1 after logging the error message.
+
+    # Check if the function received exactly three arguments
+    if [ "$#" -ne 3 ]; then
+        echo -e "${BLUE}[${RED}ERROR${BLUE}]${RESTORE} The function did not receive exactly 3 arguments."
+        exit 1
+    fi
+
+    # Assign arguments to local variables for better readability
+    local VMID=$1             # The ID of the container (VMID)
+    local SHELL=$2            # The shell to use for execution (e.g., /bin/bash)
+    local MESSAGE="$3"        # The informational message to log
+
+    # Format the log message with coloring
+    local LOG_MESSAGE="${BLUE}[${RED}ERROR${BLUE}]${RESTORE} ${MESSAGE}"
+
+    # Print the message to the console
+    echo -e "${LOG_MESSAGE}"
+
+    # Append the message to the log file inside the container
+    # The log file name is derived from the script name (${0##*/})
+    pct exec "${VMID}" -- "${SHELL}" -c "echo -e \"${LOG_MESSAGE}\" >> /root/${0##*/}.log"
+
+    # Exit with status 1 to indicate an error
+    exit 1
+}
+
+function __find_shell() {
+    # Function: __find_shell
+    # Description:
+    #   Detects the available shell type inside a Proxmox container (VM) by checking for `bash` or `sh`.
+    #   If neither is found, the function logs an error message and exits with status 1.
+    #   Additionally, it cleans up a specific log file and logs the detected shell type.
+    #
+    # Arguments:
+    #   1. VMID - (Required) The ID of the Proxmox container to check for available shells.
+    #
+    # Behavior:
+    #   - Outputs the detected shell type (`bash` or `sh`).
+
+    # Assign the VMID argument to a local variable for clarity
+    local VMID=$1
+    local SHELL_TYPE=""
+
+    # Check for the availability of `bash` in the container
+    if (( $(pct exec ${1} -- sh -c "command -v bash 2>/dev/null | grep -c \"bash\"") )); then
+        SHELL_TYPE="bash"
+
+    # Check for the availability of `sh` in the container
+    elif (( $(pct exec ${1} -- sh -c "command -v sh 2>/dev/null | grep -c \"sh\"") )); then
+        SHELL_TYPE="sh"
+    fi
+
+    echo ${SHELL_TYPE}
+}
+
+function copy_pubkey() {
+    # Function: copy_pubkey
+    # Description:
+    #   This function copies the SSH public key from the root user to a newly created user inside a container.
+    #   It ensures proper permissions are set for the `.ssh` directory and `authorized_keys` file.
+    #
+    # Parameters:
+    #   VMID        - The ID of the container where the user resides.
+    #   USER_HOME   - The home directory of the newly created user.
+    #   USER_NAME   - The username of the newly created user.
+    #   GROUP_NAME  - The group name associated with the user.
+    #
+    # Notes:
+    #   - The `authorized_keys` file in SSH specifies the public keys that are allowed for login.
+    #   - The function relies on Proxmox's `pct` command to execute tasks inside the container.
+    #   - Proper permissions are critical for SSH functionality.
+
+
+    if (( $(__check_file_exist ${VMID} ${SHELL_TYPE} "${USER_HOME}/.ssh/authorized_keys") )); then
+        # File already exists, no further action needed
+        __v_info ${VMID} ${SHELL_TYPE} "File '${USER_HOME}/.ssh/authorized_keys' already exist inside the container (${VMID})."
+
+    # Check if the authorized_keys file exists in the root user's SSH directory
+    elif (( $(__check_file_exist ${VMID} ${SHELL_TYPE} "/root/.ssh/authorized_keys") )); then
+        # Ensure the .ssh directory exists and has proper permissions
+        pct exec ${VMID} -- ${SHELL_TYPE} -c "mkdir -p ${USER_HOME}/.ssh"
+        pct exec ${VMID} -- ${SHELL_TYPE} -c "chmod 700 ${USER_HOME}/.ssh"
+        pct exec ${VMID} -- ${SHELL_TYPE} -c "chown ${USER_NAME}:${GROUP_NAME} ${USER_HOME}/.ssh"
+
+        # Copy the authorized_keys file to the user's .ssh directory
+        pct exec ${VMID} -- ${SHELL_TYPE} -c "cp /root/.ssh/authorized_keys ${USER_HOME}/.ssh/authorized_keys"
+        pct exec ${VMID} -- ${SHELL_TYPE} -c "chmod 600 ${USER_HOME}/.ssh/authorized_keys"
+        pct exec ${VMID} -- ${SHELL_TYPE} -c "chown ${USER_NAME}:${GROUP_NAME} ${USER_HOME}/.ssh/authorized_keys"
+
+        # Verify if the file was successfully copied
+        if (( $(__check_file_exist ${VMID} ${SHELL_TYPE} "${USER_HOME}/.ssh/authorized_keys") )); then
+            __v_ok ${VMID} ${SHELL_TYPE} "File copied to ${USER_HOME}/.ssh/authorized_keys successfully inside the container (${VMID})."
+        else
+            __v_error ${VMID} ${SHELL_TYPE} "File copy of /root/.ssh/authorized_keys failed inside the container (${VMID})."
+        fi
+
+    elif [ ! -z "${PUBKEY}" ]; then
+        # Ensure the .ssh directory exists and has proper permissions
+        pct exec ${VMID} -- ${SHELL_TYPE} -c "mkdir -p ${USER_HOME}/.ssh"
+        pct exec ${VMID} -- ${SHELL_TYPE} -c "chmod 700 ${USER_HOME}/.ssh"
+        pct exec ${VMID} -- ${SHELL_TYPE} -c "chown ${USER_NAME}:${GROUP_NAME} ${USER_HOME}/.ssh"
+
+        pct exec ${VMID} -- ${SHELL_TYPE} -c "echo \"${PUBKEY}\" > \"${USER_HOME}/.ssh/authorized_keys\""
+        pct exec ${VMID} -- ${SHELL_TYPE} -c "chmod 600 ${USER_HOME}/.ssh/authorized_keys"
+        pct exec ${VMID} -- ${SHELL_TYPE} -c "chown ${USER_NAME}:${GROUP_NAME} ${USER_HOME}/.ssh/authorized_keys"
+
+        # Verify if the file was successfully copied
+        if (( $(__check_file_exist ${VMID} ${SHELL_TYPE} "${USER_HOME}/.ssh/authorized_keys") )); then
+            __v_ok ${VMID} ${SHELL_TYPE} "File created '${USER_HOME}/.ssh/authorized_keys' successfully inside the container (${VMID})."
+        else
+            __v_error ${VMID} ${SHELL_TYPE} "File creation of '${USER_HOME}/.ssh/authorized_keys' failed inside the container (${VMID})."
+        fi
+
+    else
+        # Neither the user's authorized_keys nor root's authorized_keys file exists
+        __v_warning ${VMID} ${SHELL_TYPE} "File '/root/.ssh/authorized_keys' doesn't exist inside the container (${VMID}) nor provided as variable 'PUBKEY' of the hookscript. Skipping"
+    fi
+}
+
+function create_dir() {
+    # Function: __create_dir
+    # Description:
+    #   Create the directory, if not exist.
+    #
+    # Arguments:
+    #   $1 - Directory path
+
+    if [ ! -d "$1" ]; then
+        mkdir -p "${1}"
+    fi
+}
+
+function detect_init(){
+    # Function: detect_init
+    # Description:
+    #   Function to detect the initialization system used by a Proxmox container
+    #
+    # Parameters:
+    #   VMID          - The ID of the container where the user is to be created.
+    #
+    # Notes:
+    #   - The function uses Proxmox's `pct` command to execute tasks inside the container.
+
+    # Check if the container uses systemd
+    # The check involves:
+    # 1. Verifying if the directory '/run/systemd/system' exists (typical for systemd environments).
+    # 2. Checking if the 'systemctl' command is available.
+    if (( $(pct exec ${VMID} -- ${SHELL_TYPE} -c "command -v systemctl 2>/dev/null | grep -c \"systemctl\"") )); then
+        __v_info ${VMID} ${SHELL_TYPE} "Systemd is the init system inside the container (${VMID})".      # Log success for systemd detection
+        SYS_INIT="systemd"                                                                               # Set the initialization system variable to 'systemd'
+
+    # Check if the container uses OpenRC
+    # The check involves:
+    # 1. Verifying if the file '/etc/init.d/openrc' exists (common in OpenRC environments).
+    # 2. Checking if the 'rc-status' command is available.
+    elif (( $(pct exec ${VMID} -- ${SHELL_TYPE} -c "command -v rc-update 2>/dev/null | grep -c \"rc-update\" ") )); then
+        __v_ok ${VMID} ${SHELL_TYPE} "OpenRC is the init system inside the container (${VMID})."         # Log success for OpenRC detection
+        SYS_INIT="openrc"                                                                                # Set the initialization system variable to 'openrc'
+
+    # Check if the container uses Sysvinit
+    elif (( $(pct exec ${VMID} -- ${SHELL_TYPE} -c "command -v update-rc.d 2>/dev/null | grep -c \"update-rc.d\"") ))  then
+        __v_ok ${VMID} ${SHELL_TYPE} "Sysvinit is the init system inside the container (${VMID})."      # Log success for OpenRC detection
+        SYS_INIT="sysvinit"                                                                             # Set the initialization system variable to 'openrc'
+
+    # If neither systemd nor OpenRC is detected
+    else
+        __v_error ${VMID} ${SHELL_TYPE} "Unable to detect init system inside the container (${VMID})."  # Log an error for an unrecognized initialization system
+    fi
+}
+
+function detect_os {
+    # Function: detect_os
+    # Description:
+    #   Detects the operating system family of a container by inspecting the
+    #    /etc/os-release file.
+    #
+    # Parameters:
+    #   - VMID: The ID of the container.
+    # Behavior:
+    #   - Identifies the OS family based on the 'ID' field in /etc/os-release.
+    #   - Sets the OS_FAMILY variable and defines the default packages to install
+    #     for the detected OS family.
+
+    # Check if /etc/os-release exists inside the container
+    if (( $(__check_file_exist ${VMID} ${SHELL_TYPE} "/etc/os-release") )); then
+        __v_info ${VMID} ${SHELL_TYPE} "Found file '/etc/os-release'."
+
+        # Collect the value behind the variable ID=
+        ID="$(pct exec ${VMID} -- grep '^ID=' /etc/os-release | cut -d'=' -f2 | sed 's/\"//g' | cut -d' ' -f1 )"
+
+        case "${ID,,}" in
+            alpine)
+                __v_info ${VMID} ${SHELL_TYPE} "The OS inside the container (${VMID}) belongs to the Alpine family."
+                OS_FAMILY="alpine"
+                PKGS=("sudo" "openssh")
+                ;;
+            arch|manjaro)
+                __v_info ${VMID} ${SHELL_TYPE} "The OS inside the container (${VMID}) belongs to the Arch family."
+                OS_FAMILY="arch"
+                PKGS=("sudo" "openssh")
+                ;;
+            debian|ubuntu|mint|devuan)
+                __v_info ${VMID} ${SHELL_TYPE} "The OS inside the container (${VMID}) belongs to the Debian family."
+                OS_FAMILY="debian"
+                PKGS=("sudo" "openssh-server")
+                ;;
+            gentoo)
+                __v_info ${VMID} ${SHELL_TYPE} "The OS inside the container (${VMID}) belongs to the Gentoo family."
+                OS_FAMILY="gentoo"
+                PKGS=("app-admin/sudo" "net-misc/openssh")
+                ;;
+            rhel|centos|fedora|rocky|almalinux|openeuler)
+                __v_info ${VMID} ${SHELL_TYPE} "The OS inside the container (${VMID}) belongs to the RHEL family."
+                OS_FAMILY="rhel"
+                PKGS=("sudo" "openssh-server")
+                ;;
+            suse|opensuse|opensuse-leap)
+                __v_info ${VMID} ${SHELL_TYPE} "The OS inside the container (${VMID}) belongs to the S.U.S.E family."
+                OS_FAMILY="suse"
+                PKGS=("sudo" "openssh")
+                ;;
+            *)
+                __v_error ${VMID} ${SHELL_TYPE} "Unknown OS family insdie the container (${VMID})."
+                ;;
+        esac
+    else
+        __v_error ${VMID} ${SHELL_TYPE} "Cannot determine the OS family. /etc/os-release not found inside the container (${VMID})."
+    fi
+}
+
+function groupadd() {
+    # Function: groupadd
+    # Description:
+    #   This function checks if a specific group exists inside a Proxmox LXC container.
+    #   If the group does not exist, it creates the group.
+    #
+    # Parameters:
+    #   VMID        - The ID of the container where the group is to be created.
+    #   GROUP_NAME  - The name of the group to be checked or created.
+    #
+    # Notes:
+    #   - The function uses Proxmox's `pct` command to execute tasks inside the container.
+    #   - The group information is retrieved using the `getent group` command.
+    #   - If the group already exists, the function logs an informational message.
+    #   - If the group does not exist, it is created using the `groupadd` command.
+
+    # Ensure GROUP_NAME is set and not empty
+    if [ -z "${GROUP_NAME}" ]; then
+        __v_error ${VMID} ${SHELL_TYPE} "GROUP_NAME is not set. Exiting function."
+    fi
+
+    # Determine which group creation command is available inside the container
+    if (( $(pct exec ${VMID} -- ${SHELL_TYPE} -c "command -v groupadd 2>/dev/null | grep -c \"groupadd\"") )); then
+        local GROUP_CMD="groupadd -r "
+    elif (( $(pct exec ${VMID} -- ${SHELL_TYPE} -c "command -v addgroup 2>/dev/null | grep -c \"addgroup\"") )); then
+        local GROUP_CMD="addgroup -S "
+    else
+        __v_error ${VMID} ${SHELL_TYPE} "Command 'groupadd' or 'addgroup' not found inside the container (${VMID})."
+    fi
+
+
+    # Check if the group exists inside the container
+    if  (( $(__check_group ${VMID} ${SHELL_TYPE} "${GROUP_NAME}") )); then
+        # Group already exists
+         __v_info ${VMID} ${SHELL_TYPE} "Group '${GROUP_NAME}' already exists inside the container (${VMID})."
+    else
+        # Attempt to create the group if it does not exist
+        pct exec ${VMID} -- ${SHELL_TYPE} -c "${GROUP_CMD} ${GROUP_NAME}"
+
+        # Verify if the group was successfully created
+        if (( $(__check_group ${VMID} ${SHELL_TYPE} "${GROUP_NAME}") )); then
+            __v_ok ${VMID} ${SHELL_TYPE} "Group '${GROUP_NAME}' created successfully inside the container (${VMID})."
+        else
+            __v_error ${VMID} ${SHELL_TYPE} "Failed to create group '${GROUP_NAME}' inside the container (${VMID})."
+        fi
+    fi
+}
+
+function install_pkgs {
+    # Function: install_pkgs
+    # Description:
+    #   A function to install required packages in a container using package
+    #   managers specific to the operating system family.
+    #
+    # Parameters:
+    #   - OS_FAMILY: The operating system family (e.g., alpine, arch, debian,
+    #                gentoo, rhel).
+    #   - VMID: The ID of the container in which packages will be installed.
+    #   - CMD: Command to prepare the environment inside the container.
+    #   - PKGS: An array of package names to be installed.
+
+    case ${OS_FAMILY} in
+        alpine)
+            # Update repository indexes
+            pct exec ${VMID} -- ${SHELL_TYPE} -c "${CMD} && apk update &"
+
+            for PKG in "${PKGS[@]}"; do
+                # Loop through array of required packages
+
+                # Check if the package is already installed
+                if (( $(pct exec ${VMID} -- ${SHELL_TYPE} -c "apk list ${PKG} | grep -c \"installed\"") )); then
+                    __v_info ${VMID} ${SHELL_TYPE} "Package '${PKG}' was already installed inside the container (${VMID})."
+                else
+                    # Install the package
+                    pct exec ${VMID} -- ${SHELL_TYPE} -c "${CMD} && apk add ${PKG}"
+
+                    # Verify installation
+                    if (( $(pct exec ${VMID} -- ${SHELL_TYPE} -c "apk list ${PKG} | grep -c \"installed\"") )); then
+                        __v_ok ${VMID} ${SHELL_TYPE} "Package '${PKG}' installed inside the container (${VMID})."
+                    else
+                        __v_error ${VMID} ${SHELL_TYPE} "Unable to install package '${PKG}' inside the container (${VMID})."
+                    fi
+                 fi
+            done
+            ;;
+
+        arch)
+            # Initializing the keyring
+            pct exec ${VMID} -- ${SHELL_TYPE} -c "${CMD} && pacman-key --init"
+
+            # Verifying the master keys
+            pct exec ${VMID} -- ${SHELL_TYPE} -c "${CMD} && pacman-key --populate"
+
+            # Forcefully synchronize the package database
+            pct exec ${VMID} -- ${SHELL_TYPE} -c "${CMD} && pacman -Syy --noconfirm"
+
+            for PKG in "${PKGS[@]}"; do
+                # Loop through array of required packages
+
+                # Check if the package is already installed
+                if (( $(pct exec ${VMID} -- ${SHELL_TYPE} -c "pacman -Q ${PKG} 2>/dev/null | grep -c \"${PKG}\"") )); then
+                    __v_info ${VMID} ${SHELL_TYPE} "Package '${PKG}' was already installed inside the container (${VMID})."
+
+                else
+                     # Install package inside the container
+                     pct exec ${VMID} -- ${SHELL_TYPE} -c "${CMD} && pacman -S ${PKG} --noconfirm"
+
+                     # Verify installation
+                     if (( $(pct exec ${VMID} -- ${SHELL_TYPE} -c "pacman -Q ${PKG} 2>/dev/null | grep -c \"${PKG}\"") )); then
+                         __v_ok ${VMID} ${SHELL_TYPE} "Package '${PKG}' installed inside the container (${VMID})."
+                     else
+                         __v_error ${VMID} ${SHELL_TYPE} "Unable to install package '${PKG}' inside the container (${VMID})."
+                     fi
+                fi
+            done
+            ;;
+
+        debian)
+            for PKG in "${PKGS[@]}"; do
+            # Loop through array of required packages
+
+                # Check if the package is already installed
+                if (( $(pct exec ${VMID} -- ${SHELL_TYPE} -c "dpkg-query -W -f='\${Status}' $1 | grep -c \"ok installed\"") )); then
+                    __v_info ${VMID} ${SHELL_TYPE} "Package '${PKG}' was already installed inside the container (${VMID})."
+
+                else
+                     # Install package inside the container
+                     pct exec ${VMID} -- ${SHELL_TYPE} -c "${CMD} && apt -y install ${PKG}"
+
+                     # Verify installation
+                     if (( $(pct exec ${VMID} -- ${SHELL_TYPE} -c "dpkg-query -W -f='\${Status}' $1 | grep -c \"ok installed\"") )); then
+                         __v_ok ${VMID} ${SHELL_TYPE} "Package '${PKG}' installed inside the container (${VMID})."
+                     else
+                         __v_error ${VMID} ${SHELL_TYPE} "Unable to install package '${PKG}' inside the container (${VMID})."
+                     fi
+                fi
+            done
+            ;;
+
+        gentoo)
+            # Update repository indexes
+            pct exec ${VMID} -- ${SHELL_TYPE} -c "${CMD} && emerge-webrsync -q 2>/dev/null"
+
+            for PKG in "${PKGS[@]}"; do
+            # Loop through array of required packages
+
+                # Check if the package is already installed
+                if (( $(pct exec ${VMID} -- ${SHELL_TYPE} -c "emerge --pretend ${PKG} 2>/dev/null | grep -cE '^\[ebuild\s+[UR]\s+\]\s+${PKG}'") )); then
+                    __v_info ${VMID} ${SHELL_TYPE} "Package '${PKG}' was already installed inside the container (${VMID})."
+
+                else
+                     # Install package inside the container
+                     pct exec ${VMID} -- ${SHELL_TYPE} -c "${CMD} && emerge --quiet ${PKG}"
+
+                     # Verify installation
+                     if (( $(pct exec ${VMID} -- ${SHELL_TYPE} -c "emerge --pretend ${PKG} 2>/dev/null | grep -cE '^\[ebuild\s+[UR]\s+\]\s+${PKG}'") )); then
+                         __v_ok ${VMID} ${SHELL_TYPE} "Package '${PKG}' installed inside the container (${VMID})."
+                     else
+                         __v_error ${VMID} ${SHELL_TYPE} "Unable to install package '${PKG}' inside the container (${VMID})."
+                     fi
+                fi
+            done
+            ;;
+
+        rhel)
+            for PKG in "${PKGS[@]}"; do
+            # Loop through array of required packages
+
+                # Check if the package is already installed
+                if (( $(pct exec ${VMID} -- ${SHELL_TYPE} -c "dnf list --installed 2>/dev/null | grep -c \"${PKG}\"") )); then
+                    __v_info ${VMID} ${SHELL_TYPE} "Package '${PKG}' was already installed inside the container (${VMID})."
+
+                else
+                     # Install the package
+                     pct exec ${VMID} -- ${SHELL_TYPE} -c "${CMD} && dnf -y install ${PKG}"
+
+                     # Verify installation
+                     if (( $(pct exec ${VMID} -- ${SHELL_TYPE} -c "dnf list --installed 2>/dev/null | grep -c \"${PKG}\"") )); then
+                         __v_ok ${VMID} ${SHELL_TYPE} "Package '${PKG}' installed inside the container (${VMID})."
+                     else
+                         __v_error ${VMID} ${SHELL_TYPE} "Unable to install package '${PKG}' inside the container (${VMID})."
+                     fi
+                fi
+            done
+           ;;
+
+        suse)
+            # Update repository indexes
+            pct exec ${VMID} -- ${SHELL_TYPE} -c "${CMD} && export ZYPP_ARIA2C=0 && zypper refresh"
+
+            for PKG in "${PKGS[@]}"; do
+                # Loop through array of required packages
+
+                # Check if the package is already installed
+                if (( $(pct exec ${VMID} -- ${SHELL_TYPE} -c "zypper se --installed-only ${PKG} 2>/dev/null | grep -E '^i(+|)' | grep -c '\s${PKG}\s'") )); then
+                    __v_info ${VMID} ${SHELL_TYPE} "Package '${PKG}' was already installed inside the container (${VMID})."
+                else
+                    # Install the package
+                    pct exec ${VMID} -- ${SHELL_TYPE} -c "${CMD} && zypper in --no-confirm ${PKG}"
+
+                    # Verify installation
+                    if (( $(pct exec ${VMID} -- ${SHELL_TYPE} -c "zypper se --installed-only ${PKG} 2>/dev/null | grep -E '^i(+|)' | grep -c '\s${PKG}\s'") )); then
+                        __v_ok ${VMID} ${SHELL_TYPE} "Package '${PKG}' installed inside the container (${VMID})."
+                    else
+                        __v_error ${VMID} ${SHELL_TYPE} "Unable to install package '${PKG}' inside the container (${VMID})."
+                    fi
+                 fi
+            done
+            ;;
+    esac
+}
+
+function set_proxy() {
+    # Function: set_proxy
+    # Description:
+    #   Sets the proxy environment variables for HTTP, HTTPS, and NO_PROXY.
+    #   This function is useful for configuring proxy settings in a shell
+    #   session.
+    #
+    # Usage:
+    #   - Set the required variables `PROXY` and `NO_PROXY` before calling
+    #     this function.
+    #     Example:
+    #       export PROXY="http://proxy.example.com:8080"
+    #       export NO_PROXY="localhost,127.0.0.1,.example.com"
+    #       set_proxy
+    #
+    #   - After executing, the HTTP, HTTPS, and NO_PROXY proxy environment
+    #     variables will be set.
+    #
+    # Note:
+    #   - Ensure that the `PROXY` and `NO_PROXY` variables are properly
+    #     defined before invoking.
+    #   - This function modifies environment variables, which can impact
+    #     current and child processes.
+
+    # Check if PROXY variable is set
+    if [[ -z "$PROXY" ]]; then
+        __v_error ${VMID} ${SHELL_TYPE} "PROXY variable is not set inside the container (${VMID})."
+    fi
+
+    # Check if NO_PROXY variable is set
+    if [[ -z "$NO_PROXY" ]]; then
+        __v_warning ${VMID} ${SHELL_TYPE} "NO_PROXY variable is not set inside the container (${VMID}). Proceeding without it."
+    fi
+
+    # Export the proxy settings
+    CMD="export http_proxy=${PROXY} && export https_proxy=${PROXY} && export NO_PROXY=${NO_PROXY}"
+
+    # Print confirmation message
+    __v_info ${VMID} ${SHELL_TYPE} "Proxy settings successfully set inside the container (${VMID})."
+}
+
+function sshd_config() {
+    # Function: sshd_config
+    # Description:
+    #   This function ensures that the SSH configuration file inside a Proxmox
+    #   container includes a directive to include additional configuration
+    #   files. It checks for the presence of the `Include` directive and
+    #   appends it if not already present.
+    #
+    # Global Variables Used:
+    #   VMID - The ID of the Proxmox container to operate on.
+    #
+    # Behavior:
+    #   - If the main SSH configuration file does not exist, it creates it and
+    #     adds the required `Include` directive.
+    #   - If the directive already exists, it logs an informational message.
+    #   - If the directive does not exist, it appends it to the file.
+    #   - Ensures proper logging for success and failure cases.
+
+    # Define the SSH configuration file and the line to be included
+    local FILE="/etc/ssh/sshd_config"
+    local LINE="Include ${FILE}.d/*.conf"
+
+    # Define the filter to check for the 'Include' directive in the SSH config
+    # file
+    local FILTER="grep -E '^Include\s+(\"?)/etc/ssh/sshd_config\.d/\*\.conf(\"?)(\s*|$)' ${FILE} 2>/dev/null | grep -c \".conf\""
+
+    # Ensure VMID is set
+    if [ -z "${VMID}" ]; then
+        __v_error ${VMID} ${SHELL_TYPE} "VMID is not set. Exiting function."
+    fi
+
+    # Check if the SSH configuration file exists inside the container
+    if (( $(__check_file_exist ${VMID} ${SHELL_TYPE} ${FILE}) )); then
+        # The command edits a file inside a Proxmox container to comment out
+        # all lines that do not already start with #, Include, Accept, or
+        # Subsystem, preserving their current functionality.
+        pct exec ${VMID} -- ${SHELL_TYPE} -c "sed -i '/^\\s*#/! {/^\\s*\(Include\\|Accept\\|Subsystem\\)/! s/^/#/}' ${FILE}"
+
+        # File exists, check if the Include directive is already present
+        if (( $(__check_configline ${VMID} ${SHELL_TYPE} "${FILTER}") )); then
+            __v_info ${VMID} ${SHELL_TYPE} "The line '${LINE}' already exists in '${FILE}' inside the container (${VMID})."
+
+        # Append the Include directive if it does not exist
+        else
+            pct exec ${VMID} -- ${SHELL_TYPE} -c "echo ${LINE} >> ${FILE}"
+
+            # Verify if the directive was successfully appended
+            if (( $(__check_configline ${VMID} ${SHELL_TYPE} "${FILTER}") )); then
+                __v_ok ${VMID} ${SHELL_TYPE} "Successfully appended the line '${LINE}' to '${FILE}' in container (${VMID})."
+            else
+                __v_error ${VMID} ${SHELL_TYPE} "Failed to append the line '${LINE}' to '${FILE}' in container (${VMID})."
+            fi
+        fi
+
+    else
+        # File does not exist, create it and add the Include directive
+        pct exec ${VMID} -- ${SHELL_TYPE} -c "echo ${LINE} > ${FILE}"
+
+        # Verify if the directive was successfully added
+        if (( $(__check_configline ${VMID} ${SHELL_TYPE} "${FILTER}") )); then
+            __v_ok ${VMID} ${SHELL_TYPE} "Successfully added the line '${LINE}' to '${FILE}' in container (${VMID})."
+        else
+            __v_error ${VMID} ${SHELL_TYPE} "Failed to add the line '${LINE}' to '${FILE}' in container (${VMID})."
+        fi
+    fi
+}
+
+function sshd_config.d() {
+    # Function: sshd_config.d
+    # Description:
+    #   This function ensures that a specific SSHD variable (SSHD_VAR) is set
+    #   to a given value (SSHD_VAL) in the SSHD configuration files inside a
+    #   container identified by VMID. If the variable is not found, a new
+    #   configuration file is created with the specified variable and value.
+    #
+    # Parameters:
+    # 1. SSHD_VAR: The SSHD variable to check or add (e.g., PermitRootLogin).
+    # 2. SSHD_VAL: The value to set for the SSHD variable (e.g., yes, no).
+    # 3. SSHD_CONFIG_FILE: The name of the new file to create if the variable
+    #                      is missing.
+    #
+    # Notes:
+    # - This script interacts with a Proxmox container (VMID) to check and
+    #   update configuration files.
+    # - The script assumes the SSHD configuration directory is located at
+    #   /etc/ssh/sshd_config.d.
+    # - Helper functions (__create_filter, __check_configline,
+    #   __check_file_exist) are required for this script to work properly.
+
+    local SSHD_VAR=$1                                   # The SSHD variable to check or add (e.g., UsePAM)
+    local SSHD_VAL=$2                                   # The value to set for the SSHD variable (e.g., yes, no)
+    local SSHD_CONFIG_FILE=$3                           # The name of the new file to create if the variable is missing
+    local SSHD_CONFIG_DIR="/etc/ssh/sshd_config.d"      # Directory containing SSHD configuration files
+
+    # Search if directory exist
+    if (( ! $(__check_dir_exist ${VMID} ${SHELL_TYPE} "${SSHD_CONFIG_DIR}") )); then
+        # Create directory
+        pct exec ${VMID} -- ${SHELL_TYPE} -c "mkdir -p ${SSHD_CONFIG_DIR}"
+        __v_ok ${VMID} ${SHELL_TYPE} "Created the directory '${SSHD_CONFIG_DIR}' inside the container (${VMID})."
+    fi
+
+    if [[ "${SHELL_TYPE}" == "bash" ]]; then
+        local F="FILE_ARRAY=(); for FILE in \"${SSHD_CONFIG_DIR}\"/*; do [ -f \$FILE ] && FILE_ARRAY+=(\"\$FILE\"); done; echo \${FILE_ARRAY[@]}"
+        IFS=' ' read -r -a CONF_FILES <<< $(pct exec ${VMID} -- ${SHELL_TYPE} -c "${F}")
+        
+        # Determine length of array
+        local LENGTH=0
+        for FILE in "${CONF_FILES[@]}"
+        do
+            ((LENGTH++))
+        done
+
+        CONF_FILES=$(printf '"%s" ' "${CONF_FILES[@]}")
+    else
+        local CONF_FILES=$(pct exec ${VMID} -- ${SHELL_TYPE} -c "ls -d ${SSHD_CONFIG_DIR}/*.conf 2>/dev/null")
+        CONF_FILES=$(echo "$CONF_FILES" | awk '{printf "%s ", $0}')
+        local LENGTH=$(echo $CONF_FILES | wc -w)
+    fi
+
+    if [[ "${LENGTH}" ==  0 ]]; then
+        # Array is empty
+        # Meaning no files were found under /etc/ssh/sshd_config.d
+
+        __v_info ${VMID} ${SHELL_TYPE} "The directory '${SSHD_CONFIG_DIR}' is empty inside the container (${VMID})."
+
+        # Variable not found; create a new configuration file with the desired variable and value
+        local NEW_FILE_PATH="${SSHD_CONFIG_DIR}/${SSHD_CONFIG_FILE}"
+
+        # Check if the new file already exists
+        if (( ! $(__check_file_exist ${VMID} ${SHELL_TYPE} "${NEW_FILE_PATH}") )); then
+            # Create a new file and add a header
+            pct exec ${VMID} -- ${SHELL_TYPE} -c "echo \"# Created by script: ${0##*/}\" > \"${NEW_FILE_PATH}\""
+        fi
+
+        # Add the variable and its value to the new file
+        pct exec ${VMID} -- ${SHELL_TYPE} -c "echo \"${SSHD_VAR} ${SSHD_VAL}\" >> \"${NEW_FILE_PATH}\""
+        __v_ok ${VMID} ${SHELL_TYPE} "File '${NEW_FILE_PATH}' created with '${SSHD_VAR} ${SSHD_VAL}' inside the container (${VMID})."
+
+    else
+        # Array isn't empty
+        # Meaning that files are founder under /etc/ssh/sshd_config.d
+        __v_info ${VMID} ${SHELL_TYPE} "The directory '${SSHD_CONFIG_DIR}' contains files (${LENGTH}) inside the container (${VMID})."
+
+       local FOUND_FILE=0
+
+       # Create a grep filter to search for the SSHD variable in the configuration files
+       local FILTER="grep -cE '^\\s*${SSHD_VAR}\\s*\\b' ${CONF_FILES} 2>/dev/null | grep -c \":[1-9]$\""
+
+       # Search for the variable in any .conf file in the directory
+       if (( $(__check_configline ${VMID} ${SHELL_TYPE} "${FILTER}") )); then
+           FOUND_FILE=1
+           local FILTER="grep -cE '^\\s*${SSHD_VAR}\\s+${SSHD_VAL}\\b\$' ${CONF_FILES} 2>/dev/null | grep -c \":[1-9]$\""
+
+           # Check if the variable is set to the expected value
+           if (( $(__check_configline ${VMID} ${SHELL_TYPE} "${FILTER}") )); then
+                __v_info ${VMID} ${SHELL_TYPE} "Variable '${SSHD_VAR}' is already set to '${SSHD_VAL}' inside the container (${VMID})."
+           else
+                pct exec ${VMID} -- ${SHELL_TYPE} -c "sed -i 's/^\s*${SSHD_VAR}\s*.*/${SSHD_VAR} ${SSHD_VAL}/' ${SSHD_CONFIG_DIR}/*.conf"
+                __v_ok ${VMID} ${SHELL_TYPE} "Variable '${SSHD_VAR}' is updated to '${SSHD_VAL}' inside the container (${VMID})."
+            fi
+      fi
+
+      if (( ! ${FOUND_FILE} )); then
+           # The variable not found on any existing configuration files
+
+            # Variable not found; create a new configuration file with the desired variable and value
+            local NEW_FILE_PATH="${SSHD_CONFIG_DIR}/${SSHD_CONFIG_FILE}"
+
+            # Check if the new file already exists
+            if (( ! $(__check_file_exist ${VMID} ${SHELL_TYPE} "${NEW_FILE_PATH}") )); then
+                # Create a new file and add a header
+                pct exec ${VMID} -- ${SHELL_TYPE} -c "echo \"# Created by script: ${0##*/}\" > \"${NEW_FILE_PATH}\""
+            fi
+            pct exec ${VMID} -- ${SHELL_TYPE} -c "echo \"${SSHD_VAR} ${SSHD_VAL}\" >> \"${NEW_FILE_PATH}\""
+            __v_ok ${VMID} ${SHELL_TYPE} "Added '${SSHD_VAR} ${SSHD_VAL}' to file '${NEW_FILE_PATH}' inside the container (${VMID})."
+       fi
+    fi
+}
+
+function sshd_config.d_access() {
+    # Function: sshd_config.d_access
+    # Description:
+    #   This function manages SSHD configuration for a given user in a
+    #   specified VM container, ensuring that the appropriate settings
+    #   (PasswordAuthentication, PubkeyAuthentication) are applied.
+    #
+    # Arguments:
+    #   $1 - The name of the new configuration file to create or modify
+    #   $VMID - The ID of the container where the SSH configuration
+    #           should be applied.
+    #
+    # Notes:
+    # - The script assumes the container is already running and accessible.
+    # - This function requires the `pct` command to interact with Proxmox
+    #   containers.
+    # - The `__check_file_exist` and `__check_configline` helper functions are
+    #   assumed to be defined elsewhere.
+
+    local SSHD_CONFIG_FILE=$1                           # The name of the new file to create if the variable is missing
+    local SSHD_CONFIG_DIR="/etc/ssh/sshd_config.d"      # Directory containing SSHD configuration files
+    local NEW_FILE_PATH="${SSHD_CONFIG_DIR}/${SSHD_CONFIG_FILE}"  # Full path of the new file
+
+    # Required configuration content to be applied
+    local MATCH_USER="Match User ${USER_NAME}"          # SSH match user for specific settings
+    local PASSWORD_AUTH="PasswordAuthentication no"     # Disable password authentication
+    local PUBKEY_AUTH="PubkeyAuthentication yes"        # Enable public key authentication
+    local CONTENT=$(cat <<-END
+${MATCH_USER}
+    ${PASSWORD_AUTH}
+    ${PUBKEY_AUTH}
+END
+)
+
+    # Check if the configuration file exists
+    if (( $(__check_file_exist ${VMID} ${SHELL_TYPE} "${NEW_FILE_PATH}") )); then
+        # File exists: Check if the user-specific configuration is already present
+        local FILTER=$(__create_filter "grep -qE \"^\\s*${MATCH_USER}\$\" \"${NEW_FILE_PATH}\"")
+
+        if (( $(__check_configline ${VMID} ${SHELL_TYPE} "${FILTER}") )); then
+           # The user-specific match is found, check if PasswordAuthentication is configured
+           __v_info ${VMID} ${SHELL_TYPE} "The '${MATCH_USER}' is already set inside the container (${VMID})."
+
+           # Check for PasswordAuthentication setting
+           local FILTER=$(__create_filter "grep -A 2 -E \"^\\s*${MATCH_USER}\$\" \"${NEW_FILE_PATH}\" | grep -qE \"^\\s*${PASSWORD_AUTH}\$\"")
+
+           if (( $(__check_configline ${VMID} ${SHELL_TYPE} "${FILTER}") )); then
+               __v_info ${VMID} ${SHELL_TYPE} "The '${PASSWORD_AUTH}' is already set inside the container (${VMID})."
+
+           else
+               # PasswordAuthentication is not set, update the file
+
+               # Remove "Match User ansible" and the next two lines, then append the new content
+               pct exec ${VMID} -- ${SHELL_TYPE} -c "sed -i '/^${MATCH_USER}/,/^\$/d' \"${NEW_FILE_PATH}\""
+               pct exec ${VMID} -- ${SHELL_TYPE} -c "echo \"${CONTENT}\" >> \"${NEW_FILE_PATH}\""
+               __v_warning ${VMID} ${SHELL_TYPE} "Updated lines under '${MATCH_USER}' due mismatch of '${PASSWORD_AUTH}'s inside the container (${VMID})."
+           fi
+
+           # Check for PubkeyAuthentication setting
+           local FILTER=$(__create_filter "grep -A 2 -E \"^\\s*${MATCH_USER}\$\" \"${NEW_FILE_PATH}\" | grep -qE \"^\\s*${PUBKEY_AUTH}\$\"")
+
+           if (( $(__check_configline ${VMID} ${SHELL_TYPE} "${FILTER}") )); then
+               __v_info ${VMID} ${SHELL_TYPE} "The '${PUBKEY_AUTH}' is already set inside the container (${VMID})."
+
+           else
+               # PubkeyAuthentication is not set, update the file
+
+               # Remove "Match User ansible" and the next two lines, then append the new content
+               pct exec ${VMID} -- ${SHELL_TYPE} -c "sed -i '/^${MATCH_USER}/,/^\$/d' \"${NEW_FILE_PATH}\""
+               pct exec ${VMID} -- ${SHELL_TYPE} -c "echo \"${CONTENT}\" >> \"${NEW_FILE_PATH}\""
+               __v_warning ${VMID} ${SHELL_TYPE} "Updated lines under '${MATCH_USER}' due mismatch of '${PUBKEY_AUTH}'s inside the container (${VMID})."
+           fi
+
+
+        else
+           # User-specific configuration is not found: Append content to the file
+           pct exec ${VMID} -- ${SHELL_TYPE} -c "echo \"${CONTENT}\" >> \"${NEW_FILE_PATH}\""
+           __v_ok ${VMID} ${SHELL_TYPE} "Append below content to file '${NEW_FILE_PATH}' inside the container (${VMID}).\n${CONTENT}"
+        fi
+
+    else
+        # File doesn't exist: Create a new file with header and content
+        pct exec ${VMID} -- ${SHELL_TYPE} -c "echo \"# Created by script: ${0##*/}\" > \"${NEW_FILE_PATH}\""
+        pct exec ${VMID} -- ${SHELL_TYPE} -c "echo \"${CONTENT}\" >> \"${NEW_FILE_PATH}\""
+        __v_ok ${VMID} ${SHELL_TYPE} "Created file '${NEW_FILE_PATH}' with below content inside the containter (${VMID}).\n${CONTENT}"
+    fi
+}
+
+function sshd_openrc() {
+    # Function: sshd_openrc
+    # Description:
+    #
+
+    # Define the default INIT PATH
+    local SERVICE_PATH="/etc/init.d"
+
+
+    if (( $(__check_file_exist ${VMID} ${SHELL_TYPE} "${SERVICE_PATH}/sshd") )); then
+        # Define the default SSHD service name
+        local SERVICE="sshd"
+
+    elif (( $(__check_file_exist ${VMID} ${SHELL_TYPE} "${SERVICE_PATH}/ssh") )); then
+        # Define the default SSHD service name
+        local SERVICE="ssh"
+    else
+        __v_error ${VMID} ${SHELL_TYPE} "Unable to find the SSH(D) service inside the container (${VMID})."
+    fi
+
+    # Log the detected or default service name
+    __v_info ${VMID} ${SHELL_TYPE} "The OpenRC service name is '${SERVICE}' inside the container (${VMID})."
+
+    if (( $(pct exec ${VMID} -- ${SHELL_TYPE} -c "${SERVICE_PATH}/${SERVICE} status 2>/dev/null | grep -c \"started\"") )); then
+        # Restart the service since already started
+        pct exec ${VMID} -- ${SHELL_TYPE} -c "${SERVICE_PATH}/${SERVICE} restart"
+        __v_ok ${VMID} ${SHELL_TYPE} "Restart the '${SERVICE}' inside the container (${VMID})."
+
+    else
+        # Start the service due inactive
+        pct exec ${VMID} -- ${SHELL_TYPE} -c "${SERVICE_PATH}/${SERVICE} start"
+        __v_ok ${VMID} ${SHELL_TYPE} "Restart the '${SERVICE}' inside the container (${VMID})."
+    fi
+
+    if (( $(pct exec ${VMID} -- ${SHELL_TYPE} -c "rc-update show default 2>/dev/null | grep -c \"${SERVICE}\"") )); then
+        pct exec ${VMID} -- ${SHELL_TYPE} -c "rc-update add ${SERVICE}"
+        __v_ok ${VMID} ${SHELL_TYPE} "Enabled '${SERVICE}' to start automatically at boot inside the container (${VMID})."
+    else
+        __v_info ${VMID} ${SHELL_TYPE} "'${SERVICE}' is already enabled to start at boot inside the container (${VMID})."
+    fi
+}
+
+function sshd_systemd() {
+    # Function: sshd_systemd
+    # Description:
+    #   This function manages the SSHD service inside a Proxmox LXC container.
+    #   It ensures the SSHD service is running and enabled at boot within the
+    #   container specified by the global variable `VMID`.
+    #
+    # Notes:
+    #   - The function assumes `VMID` is set globally to the target container
+    #     ID.
+    #   - The helper functions `v_info` and `v_ok` are used for logging
+    #     informational and success messages.
+    #   - The `pct` command is used to execute commands inside the LXC
+    #     container.
+
+    # Define the default SSHD service name
+    local SERVICE="sshd.service"
+
+    # Check if the service is an alias inside the container
+    local FILTER="systemctl list-unit-files | grep -c -E '^${SERVICE}\\s+alias' 2>/dev/null"
+
+    # If SSHD is an alias, determine the real service name
+    if (( $(pct exec ${VMID} -- ${SHELL_TYPE} -c "${FILTER}") )); then
+        SERVICE=$(pct exec ${VMID} -- ${SHELL_TYPE} -c "ls -l /etc/systemd/system/sshd.service 2>/dev/null | awk -F '/' '{print \$NF}'")
+    fi
+
+    # Log the detected or default service name
+    __v_info ${VMID} ${SHELL_TYPE} "Systemd service name is '${SERVICE}' inside the container (${VMID})."
+
+    # Check if the service is inactive inside the container
+    local COND=$(pct exec ${VMID} -- ${SHELL_TYPE} -c "systemctl is-active ${SERVICE} 2>/dev/null | grep -c \"inactive\"")
+
+    if (( ${COND} )); then
+        # Start the service if it's inactive
+        pct exec ${VMID} -- ${SHELL_TYPE} -c "systemctl start ${SERVICE}"
+        __v_ok ${VMID} ${SHELL_TYPE} "Start the '${SERVICE}' inside the container (${VMID})."
+    else
+        # Restart the service if it's active
+        pct exec ${VMID} -- ${SHELL_TYPE} -c "systemctl restart ${SERVICE}"
+        __v_ok ${VMID} ${SHELL_TYPE} "Restart the '${SERVICE}' inside the container (${VMID})."
+
+     fi
+
+     # Ensure the service is enabled to start at boot
+     if (( $(pct exec ${VMID} -- ${SHELL_TYPE} -c "systemctl is-enabled ${SERVICE} 2>/dev/null | grep -c \"disabled\"") )); then
+         pct exec ${VMID} -- ${SHELL_TYPE} -c "systemctl enable ${SERVICE}"
+         __v_ok ${VMID} ${SHELL_TYPE} "Enabled '${SERVICE}' to start automatically at boot inside the container (${VMID})."
+     else
+         __v_info ${VMID} ${SHELL_TYPE} "'${SERVICE}' is already enabled to start at boot inside the container (${VMID})."
+     fi
+}
+
+function sshd_sysvinit() {
+    # Function: sshd_sysvinit
+    # Description:
+    #   This function manages the Sysvinit-based SSHD (or SSH) service inside a Proxmox LXC container.
+    #   It checks for the existence of the SSHD service script, starts or restarts the service as needed,
+    #   and ensures it is enabled to start automatically at boot.
+
+    # Define the default INIT PATH
+    local SERVICE_PATH="/etc/init.d"
+
+    # Check for the SSHD service file and set the service name accordingly
+    if (( $(__check_file_exist ${VMID} ${SHELL_TYPE} "${SERVICE_PATH}/sshd") )); then
+        # Define the default SSHD service name
+        local SERVICE="sshd"
+
+    elif (( $(__check_file_exist ${VMID} ${SHELL_TYPE} "${SERVICE_PATH}/ssh") )); then
+        # Define the default SSHD service name
+        local SERVICE="ssh"
+    else
+        __v_error ${VMID} ${SHELL_TYPE} "Unable to find the SSH(D) service inside the container (${VMID})."
+    fi
+
+    # Log the detected or default service name
+    __v_info ${VMID} ${SHELL_TYPE} "The Sysvinit service name is '${SERVICE}' inside the container (${VMID})."
+
+    # Check the current status of the service
+    if (( $(pct exec ${VMID} -- ${SHELL_TYPE} -c "${SERVICE_PATH}/${SERVICE} status 2>/dev/null | grep -c \"started\"") )); then
+        # Restart the service since already started
+        pct exec ${VMID} -- bash -c "${SERVICE_PATH}/${SERVICE} restart"
+        __v_ok ${VMID} ${SHELL_TYPE} "Restart the '${SERVICE}' inside the container (${VMID})."
+
+    else
+        # Start the service due inactive
+        pct exec ${VMID} -- ${SHELL_TYPE} -c "${SERVICE_PATH}/${SERVICE} start"
+        __v_ok ${VMID} ${SHELL_TYPE} "Start the '${SERVICE}' inside the container (${VMID})."
+    fi
+
+    # Ensure the service is enabled to start automatically at boot
+    if (( $(pct exec ${VMID} -- ${SHELL_TYPE} -c "ls -l /etc/rc*.d 2>/dev/null | grep -c \"${SERVICE}\" >/dev/null && echo 0 || echo 1") )); then
+         pct exec ${VMID} -- ${SHELL_TYPE} -c "update-rc.d ${SERVICE} defaults"
+         __v_ok ${VMID} ${SHELL_TYPE} "Enabled '${SERVICE}' to start automatically at boot inside the container (${VMID})."
+     else
+         __v_info ${VMID} ${SHELL_TYPE} "'${SERVICE}' is already enabled to start at boot inside the container (${VMID})."
+     fi
+}
+
+function sudoers() {
+    # Function: sudoers
+    # Description:
+    #   This function ensures that a sudoers file for the specified group is present
+    #   inside the container. If the file doesn't exist, it creates one granting
+    #   passwordless sudo access to members of the group.
+    #
+    # Parameters:
+    #   VMID        - The ID of the container where the group is to be created.
+    #   GROUP_NAME  - The name of the file, based on group name, to be checked or created
+    #
+    # Notes:
+    #   - The function uses Proxmox's `pct` command to execute tasks inside the container.
+
+
+    # Check if the group name is defined
+    if [ -z "${GROUP_NAME}" ]; then
+        v_error "GROUP_NAME is not set. Exiting function."
+    fi
+
+    if (( ! $(__check_dir_exist ${VMID} ${SHELL_TYPE} "/etc/sudoers.d") )); then
+        # Create directory if not exist
+        pct exec ${VMID} -- ${SHELL_TYPE} -c "mkdir -p \"/etc/sudoers.d\""
+    fi
+
+    # Check if the sudoers file already exists for the specified group
+    if (( $(__check_file_exist ${VMID} ${SHELL_TYPE} "/etc/sudoers.d/${GROUP_NAME}") )); then
+        __v_info ${VMID} ${SHELL_TYPE} "File '/etc/sudoers.d/${GROUP_NAME}' already exists inside the container (${VMID})."
+    else
+        # Create a new sudoers file for the group
+        pct exec ${VMID} -- ${SHELL_TYPE} -c "echo \"%${GROUP_NAME} ALL=(ALL:ALL) NOPASSWD:ALL\" > /etc/sudoers.d/${GROUP_NAME}"
+
+        # Ensure the sudoers file has proper permissions
+        pct exec ${VMID} -- ${SHELL_TYPE} -c "chmod 0440 \"/etc/sudoers.d/${GROUP_NAME}\""
+
+        # Verify if the sudoers file was created successfully
+        if (( $(__check_file_exist ${VMID} ${SHELL_TYPE} "/etc/sudoers.d/${GROUP_NAME}") )); then
+            __v_ok ${VMID} ${SHELL_TYPE} "File '/etc/sudoers.d/${GROUP_NAME}' created successfully inside the container (${VMID})."
+        else
+            __v_error ${VMID} ${SHELL_TYPE} "Failed to create file '/etc/sudoers.d/${GROUP_NAME}' inside the container (${VMID})."
+        fi
+    fi
+}
+
+function useradd() {
+    # Function: useradd
+    # Description:
+    #   This function checks if a specific user exists inside a Proxmox LXC container.
+    #   If the user does not exist, it creates the user with the specified parameters.
+    #
+    # Parameters:
+    #   VMID          - The ID of the container where the user is to be created.
+    #   USER_NAME     - The username to be checked or created.
+    #   GROUP_NAME    - The group the user belongs to.
+    #   USER_COMMENT  - A comment or description for the user.
+    #   USER_HOME     - The home directory for the user.
+    #   USER_SHELL    - The shell to be assigned to the user.
+    #
+    # Notes:
+    #   - The function uses Proxmox's `pct` command to execute tasks inside the container.
+    #   - If the shell is not explicitly defined or found, the user is created with the system's default shell.
+    #   - If the user already exists, the function logs an informational message.
+
+    # Ensure required variables are set
+    if [ -z "${USER_NAME}" ] || [ -z "${GROUP_NAME}" ] || [ -z "${VMID}" ]; then
+        __v_error ${VMID} ${SHELL_TYPE} "USER_NAME, GROUP_NAME, or VMID is not set. Exiting function."
+    fi
+
+    # Get Shell path, fallback to /bin/bash if SHELL_TYPE is undefined or invalid
+    SHELL_PATH=$(pct exec ${VMID} -- ${SHELL_TYPE} -c "command -v ${SHELL_TYPE}")
+
+    # Determine which user creation command is available inside the container
+    if (( $(pct exec ${VMID} -- ${SHELL_TYPE} -c "command -v useradd 2>/dev/null | grep -c \"useradd\"") )); then
+        local USER_CMD="useradd"
+    elif (( $(pct exec ${VMID} -- ${SHELL_TYPE} -c "command -v adduser 2>/dev/null | grep -c \"adduser\"") )); then
+        local USER_CMD="adduser"
+    else
+        __v_error ${VMID} ${SHELL_TYPE} "Command 'useradd' or 'adduser' not found inside the container (${VMID})."
+    fi
+
+    # Check if the user already exists inside the container
+    if (( $(__check_user ${VMID} ${SHELL_TYPE} "${USER_NAME}") )); then
+        # User already exists
+        __v_info ${VMID} ${SHELL_TYPE} "User '${USER_NAME}' already exists inside the container (${VMID})."
+
+    else
+        # Create the user with appropriate command
+        if [[ "${USER_CMD}" = "useradd" ]]; then
+            # Create user
+            pct exec ${VMID} -- ${SHELL_TYPE} -c "useradd -m -r -g \"${GROUP_NAME}\" -c \"${USER_COMMENT}\" -d \"${USER_HOME}\" -s \"${SHELL_PATH}\" \"${USER_NAME}\""
+
+        elif [[ "${USER_CMD}" = "adduser" ]]; then
+            # Create user
+            pct exec ${VMID} -- ${SHELL_TYPE} -c "adduser -S -G \"${GROUP_NAME}\" -g \"${USER_COMMENT}\" -h \"${USER_HOME}\" -s \"${SHELL_PATH}\" \"${USER_NAME}\""
+        fi
+
+        # Verify if the user creation was successful
+        if (( $(__check_user ${VMID} ${SHELL_TYPE} "${USER_NAME}") )); then
+            __v_ok ${VMID} ${SHELL_TYPE} "User '${USER_NAME}' created inside the container (${VMID})."
+        else
+            __v_error ${VMID} ${SHELL_TYPE} "Unable to create user '${USER_NAME}' inside the container (${VMID})."
+        fi
+    fi
+}
+
+# ----------------------------------------------------------------------------
+# M A I N
+# ----------------------------------------------------------------------------
+#
+
+# Description:
+#   This script manages hook phases for a specified Proxmox virtual machine (VM).
+#   Depending on the phase provided as an argument, it performs actions such as logging
+#   and detecting the shell type inside the VM. Logs are stored in a centralized directory.
+#
+# Arguments:
+#   1. VMID  - (Required) The ID of the Proxmox virtual machine.
+#   2. PHASE - (Required) The hook phase (pre-start, post-start, pre-stop, post-stop).
+#
+# Behavior:
+#   - Creates a directory for logs if it doesn't exist.
+#   - Logs messages for each phase.
+#   - Detects the shell type during the post-start phase using the `__find_shell` function.
+#
+# Exit Status:
+#   - Exits with 0 if successful.
+#   - Exits with a non-zero status for invalid phases or errors.
+#
+# Example Usage:
+#   ./hook_script.sh 100 pre-start
+
+# Assign arguments to variables for better readability
+VMID=$1
+PHASE=$2
+
+# Define BASH color codes for formatted output
+RESTORE='\033[0m'
+RED='\033[00;31m'
+GREEN='\033[00;32m'
+YELLOW='\033[00;33m'
+BLUE='\033[00;34m'
+PURPLE='\033[00;35m'
+CYAN='\033[00;36m'
+LIGHTGRAY='\033[00;37m'
+
+# Global variables
+GROUP_NAME="{{ hookscript_groupname }}"
+NO_PROXY="{{ hookscript_noproxy | default("localhost,127.0.0.1/8") }}"
+PROXY="{{ hookscript_proxy | default("http://localhost:8080") }}"
+PUBKEY="{{ hookscript_pubkey | default(none) }}"
+USE_PROXY="{{ hookscript_use_proxy | default(false) }}"
+USER_NAME="{{ hookscript_username }}"
+USER_COMMENT="Ansible Deploy User"
+USER_HOME="/var/local/system/${USER_NAME}"
+USER_SHELL="bash"
+
+
+# Main script logic based on the hook phase
+case "$PHASE" in
+  pre-start)
+    # Handle pre-start phase
+    create_dir "/tmp/hookscript_logs"
+    echo -e "${BLUE}[${GREEN}$(date +'%Y-%m-%d %H:%M:%S')${BLUE}]${RESTORE} Pre-start phase for VM $VMID" > /tmp/hookscript_logs/${VMID}.log
+    ;;
+
+  post-start)
+    # Handle post-start phase
+    create_dir "/tmp/hookscript_logs"
+    echo -e "${BLUE}[${GREEN}$(date +'%Y-%m-%d %H:%M:%S')${BLUE}]${RESTORE} Post-start phase for VM $VMID" >> /tmp/hookscript_logs/${VMID}.log
+
+    # Detect the shell type inside the VM using the __find_shell function
+    SHELL_TYPE=$(__find_shell ${VMID})
+
+    case "${SHELL_TYPE,,}" in
+        sh|bash)
+            # Remove the log file associated with the script, if it exists
+            pct exec ${VMID} -- ${SHELL_TYPE} -c "rm -rf /root/${0##*/}.log"
+            __v_ok ${VMID} ${SHELL_TYPE} "Initiated '${0##*/}' on $(date +'%c')."
+            __v_info ${VMID} ${SHELL_TYPE} "Detected shell type is ${SHELL_TYPE}."
+            ;;
+        *)
+            echo -e "${BLUE}[${RED}ERROR${BLUE}]${RESTORE} Unable to find the command 'bash' and/or 'sh' inside the container (${VMID})."
+            exit 1
+    esac
+
+    detect_os;
+    detect_init;
+    [[ "${USE_PROXY,,}" = "true" ]] && set_proxy;
+    install_pkgs;
+
+    # Add or Update configuration file(s)
+    for PKG in "${PKGS[@]}"; do
+       if [[ "${PKG}" =~ "openssh" ]]; then
+           sshd_config;
+           sshd_config.d "Port" "22" "01-port.conf";
+           sshd_config.d "PubkeyAuthentication" "yes" "10-authentication.conf";
+           sshd_config.d "UsePAM" "yes" "10-authentication.conf";
+           sshd_config.d_access "90-access_control.conf";
+
+           # Start/enable service
+           if [ "${SYS_INIT}" = "systemd" ]; then
+               sshd_systemd
+           elif [ "${SYS_INIT}" = "openrc" ]; then
+               sshd_openrc
+           elif [ "${SYS_INIT}" = "sysvinit" ]; then
+               sshd_sysvinit
+           fi
+
+       elif [[ "${PKG}" = "sudo" ]]; then
+           sudoers;
+       fi
+   done
+
+    groupadd;
+    useradd;
+    copy_pubkey;
+
+    __v_ok ${VMID} ${SHELL_TYPE} "Ended '${0##*/}' on $(date +'%c')."
+    # Log the successful execution of the script
+    echo -e "${BLUE}[${GREEN}$(date +'%Y-%m-%d %H:%M:%S')${BLUE}]${RESTORE} Script '${0##*/}' executed successfully."  >> /tmp/hookscript_logs/${VMID}.log
+   ;;
+
+  pre-stop)
+    # Handle pre-stop phase
+    create_dir "/tmp/hookscript_logs"
+    echo -e "${BLUE}[${GREEN}$(date +'%Y-%m-%d %H:%M:%S')${BLUE}]${RESTORE} Pre-stop phase for VM $VMID" >> /tmp/hookscript_logs/${VMID}.log
+    ;;
+
+  post-stop)
+    # Handle post-stop phase
+    create_dir "/tmp/hookscript_logs"
+    echo -e "${BLUE}[${GREEN}$(date +'%Y-%m-%d %H:%M:%S')${BLUE}]${RESTORE} Post-stop phase for VM $VMID" >> /tmp/hookscript_logs/${VMID}.log
+    ;;
+esac
