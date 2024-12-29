@@ -1,0 +1,16 @@
+galaxy_info:
+  namespace: lorephoenix
+  role_name: pve_hookscript
+  author: Christophe Vemeren
+  description: Proxmox Virtual Environment - hookscript
+  company: Independent
+  license: MIT
+  min_ansible_version: "2.11"
+  platforms:
+    - name: Debian
+      versions:
+        - bookworm
+  galaxy_tags:
+    - proxmox
+dependencies: []
+collections: []
