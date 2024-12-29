@@ -1,0 +1,99 @@
+---
+# tasks file for pve_hookscript
+
+#
+#  ████████╗ █████╗ ███████╗██╗  ██╗
+#  ╚══██╔══╝██╔══██╗██╔════╝██║ ██╔╝
+#     ██║   ███████║███████╗█████╔╝
+#     ██║   ██╔══██║╚════██║██╔═██╗
+#     ██║   ██║  ██║███████║██║  ██╗
+#     ╚═╝   ╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝
+#
+
+# -----------------------------------------------------------------------------
+# TASK FILE: main.yml
+# DESCRIPTION:
+#   This Ansible role performs the following tasks:
+#   - Verifies that the target operating system is Debian.
+#   - Installs necessary Debian packages (e.g., jq).
+#   - Checks for the availability of the Proxmox command-line utility (`pvesh`).
+#   - Retrieves and validates the Proxmox Virtual Environment (PVE) version.
+#   - Ensures the PVE version is 8.0 or higher.
+#   - Identifies storage paths with "snippets" content.
+#   - Templates a custom hook script to the identified snippet storage paths.
+# -----------------------------------------------------------------------------
+
+# Ensures that the playbook is executed only on Debian-based systems.
+- name: (pve_hookscript) | main | Assert that the operating system is Debian
+  ansible.builtin.assert:
+    that:
+      - ansible_facts['os_family'] == "Debian"
+    fail_msg: "The operating system is not Debian."
+    success_msg: "The operating system is Debian."
+
+# Installs the `jq` package, a lightweight and flexible command-line JSON
+# processor.
+- name: (pve_hookscript) | main | Install Debian packages
+  become: true
+  ansible.builtin.apt:
+    name:
+      - jq
+    state: present
+  notify:
+    - Update package cache
+
+# Verifies that the `pvesh` command-line tool is installed and available in the
+# system PATH.
+- name: (pve_hookscript) | main | Check if pveversion command is available
+  ansible.builtin.shell:
+    cmd: command -v pvesh
+    executable: /bin/bash
+  changed_when: false
+  failed_when: pveversion_check.rc != 0
+  register: pveversion_check
+
+# Retrieves the release version of Proxmox VE using `pvesh` and `jq`.
+- name: (pve_hookscript) | main | Get Proxmox version
+  become: true
+  ansible.builtin.shell:
+    cmd: set -o pipefail && pvesh get version --output-format json | jq -r '.release'
+    executable: /bin/bash
+  changed_when: false
+  register: pveversion
+  when: pveversion_check.rc == 0
+
+# Ensures that the Proxmox VE version meets the minimum requirement of 8.0.
+- name: (pve_hookscript) | main | Assert PVE version is 8.0 or higher
+  ansible.builtin.assert:
+    that:
+      - pveversion.stdout is version('8.0', '>=')
+    fail_msg: "PVE version must be 8.0 or higher. Current version is {{ pveversion.stdout }}."
+    success_msg: "PVE version {{ pveversion.stdout }} is 8.0 or higher."
+
+ # Finds storage paths in Proxmox where the content field includes "snippets".
+- name: (pve_hookscript) | main | Get the storage paths where the content field contains "snippets"
+  become: true
+  ansible.builtin.shell:
+    cmd: "set -o pipefail && pvesh get storage --output-format json | jq -r '.[] | select(.content | contains(\"snippets\")) | .path'"
+    executable: /bin/bash
+  changed_when: false
+  register: storages
+
+ # Stops the playbook with a custom error message if no snippet storage paths are found.
+- name: (pve_hookscript) | main | Fail with a custom message if no storage paths found
+  ansible.builtin.fail:
+    msg: "No storage paths found with content containing 'snippets'. Please verify the Proxmox storage configuration."
+  when: storages.stdout_lines | length == 0
+
+# Deploys a templated hook script to the identified snippet storage paths.
+# Ensures the script has the correct ownership and permissions for execution.
+- name: (pve_hookscript) | main | Template a file to snippets storage(s)
+  become: true
+  ansible.builtin.template:
+    src: hookscript.j2
+    dest: "{{ item }}/snippets/hookscript_{{ hookscript_username }}.sh"
+    owner: root
+    group: root
+    mode: '0755'
+  with_items:
+    - "{{ storages.stdout_lines }}"
